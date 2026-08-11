@@ -4,52 +4,25 @@ Part A/B/C exercise for the NANDA Town quickstart. Scenario: `reputation`.
 Setting changed: `failures.byzantine_agents` (`0.0` -> `0.2`), one setting,
 everything else identical (same seed, same agent counts, same rounds).
 
-## Why this scenario
+## Which setting I changed, and why
 
-I ran through the quickstart and then looked at what built-in scenarios were
-available (`nest scenarios list`): `auction`, `consensus`, `marketplace`,
-`reputation`, `shell_marketplace`, `supply_chain`, `voting`. I picked
-`reputation` because it's a scenario about trust, not just message delivery:
-honest agents trade reliably, malicious agents sometimes cheat, and an
-observer keeps score and calls out bad actors once they cross a threshold.
-That felt like a more interesting system to break than a simple buy/sell
-negotiation.
+I changed `failures.byzantine_agents` in the reputation scenario from 0.0 to
+0.2, holding seed, agent counts, and rounds constant. I picked `reputation`
+because trust between counterparties is the part of any market I find most
+interesting — it's not just about whether messages get delivered, it's about
+whether bad behavior gets caught.
 
 ## Hypothesis
 
-My first instinct was: if I turn up `byzantine_agents`, reputation scores
-should just go down more, since I'm adding another way for things to go
-wrong on top of the cheating that's already happening.
+Reading the source with Claude Code, two things stood out: only honest
+agents ever file reports (`nest_core/scenarios_builtin/reputation.py`), and
+byzantine mode corrupts everything an agent sends
+(`nest_core/sim/simulator.py`).
 
-But once I actually read how the observer gets its information
-(`nest_core/scenarios_builtin/reputation.py`), I don't think that's right.
-Reports only flow one way: the agent that *initiated* a trade is the one who
-reports on whoever responded, and only honest agents ever send a report —
-malicious agents never report anyone, even when they catch another malicious
-agent cheating them. So a lot of bad behavior is already invisible to the
-observer before `byzantine_agents` even enters the picture.
-
-What `byzantine_agents` actually does is corrupt the *outgoing* messages of
-whichever agents get flagged (confirmed in `nest_core/sim/simulator.py`). If
-a malicious agent gets flagged and its `cheat:` reply gets corrupted on the
-way to an honest trader, that honest trader never recognizes it as a cheat —
-so it never sends the "bad" report that would've hurt that agent's score.
-There's no retry, so that report is just gone.
-
-**So my actual hypothesis is the opposite of my first guess:** increasing
-`byzantine_agents` won't push reputation scores down further — it'll
-suppress the observer's ability to detect bad behavior at all. I expect
-fewer total reports reaching the observer as `byzantine_agents` goes up,
-fewer (or later) warning broadcasts, and malicious agents potentially ending
-up with *less* negative scores than in the base case — not because they're
-behaving better, but because their bad behavior is getting silently dropped
-before anyone can report it. In other words, adding byzantine failures
-should mask cheating rather than expose more of it.
-
-**What I checked to confirm or falsify this:** how many `report:` messages
-actually reach the observer, how many `warning:` broadcasts go out, and
-whether malicious agents' final scores end up higher (less negative) than in
-the base case.
+So my hypothesis was that raising `byzantine_agents` would not make cheaters
+look worse, it would make them harder to see: fewer reports reaching the
+observer, fewer warnings, and malicious agents scoring closer to neutral
+because their behavior gets dropped instead of caught.
 
 ## How to reproduce
 
@@ -69,6 +42,13 @@ internally, over the raw trace, to reconstruct exactly what the observer saw.
 
 ## Evidence
 
+Baseline at 0.0: 80 reports reached the observer, 70 good and 10 bad, 3
+warnings broadcast, malicious agents averaging -3.00 and honest agents 3.88,
+across 620 messages and 101 unique pairs.
+
+At 0.2: 38 reports, 35 good and 3 bad, 1 warning, malicious average up to
+-1.00, honest average down to 2.46, 304 messages, 68 pairs.
+
 | | Baseline (0.0) | Experiment (0.2) | Δ |
 |---|---|---|---|
 | Total reports reaching observer | 80 | 38 | **-52%** |
@@ -78,52 +58,57 @@ internally, over the raw trace, to reconstruct exactly what the observer saw.
 | Total message volume (`nest report`) | 620 | 304 | -51% |
 | Unique interacting pairs | 101 | 68 | -33 |
 
-This matches the hypothesis: adding byzantine corruption didn't push scores
-further down, it suppressed detection. Fewer reports overall, way fewer bad
-reports specifically, fewer warnings, and malicious agents looking better on
-average, not worse.
+Nest's built-in metrics don't cover reputation-specific detection, so I had
+Claude Code write a script that replays the observer's own +1 good, -2 bad
+rule over the raw trace. What really matters is that bad reports fell 70
+percent while total reports fell 52 percent. Corruption suppresses the
+detection of cheating specifically, not just message volume. The agents
+behaving worst came out of it looking better than before.
 
 ## Investigating the surprise
 
-The one thing I didn't expect going in: `malicious-0` has a real score in
-the baseline (-6) but doesn't appear in the experiment's results at all —
-zero reports, good or bad, in either direction.
+What I didn't expect was malicious-0 vanishing. It scored -6 in the baseline
+and disappears from the experiment with zero reports, good or bad, in
+either direction.
 
-I traced this by grepping the raw experiment trace for `malicious-0`. It
-turns out `malicious-0` itself got flagged byzantine. Every message it sends
-comes out corrupted — for example its `cheat:1:malicious-0` reply to
-`honest-15` arrives as unreadable bytes (same `corr` correlation ID, garbled
-payload), so `honest-15` never recognizes it as a cheat and never files a
-report. The same thing happens to `malicious-0`'s own `trade:` requests when
-it's the initiator — nobody can respond to gibberish, so those threads never
-go anywhere either.
-
-So this isn't just "harder to catch" — being flagged byzantine can erase an
-agent from the reputation system completely, in both directions (as cheater
-and as trader), since corruption applies to every message that agent sends,
-not just the ones relevant to a specific interaction. That's a sharper
-version of the hypothesis than I'd predicted: masking isn't always partial.
+I went into the raw trace, pulled every event involving it, and matched
+sends against receives by correlation ID. Its cheat reply to honest-15
+arrived as corrupted bytes, so honest-15 never recognized a cheat and filed
+nothing. Its own trade requests were corrupted too, so nobody could respond
+to those either. Malicious-0 had itself been flagged byzantine, and that
+corrupts everything it sends, not just the messages tied to one interaction.
+It wasn't harder to catch, it was erased from the reputation system in both
+directions. That's a stronger failure mode than I predicted, and the more
+concerning one, because the system can't tell the difference between an
+agent behaving well and an agent it can't hear.
 
 One more thing worth noting, not surprising but worth being honest about:
-honest agents' average score also dropped (3.88 -> 2.46 in my full run
-output). That's not a separate effect — it's the same no-retry mechanism:
+honest agents' average score also dropped (3.88 -> 2.46). That's the same
+no-retry mechanism playing out system-wide, not a separate effect —
 byzantine corruption stalls negotiation threads early throughout the system
 (not just malicious-flagged ones), so there's less total activity for
 anyone, honest or malicious, to be reported on.
 
+## What I'd build next for NANDA Town
+
+A "silence detector." My experiment showed that corrupted agents disappear
+from the reputation record entirely, because reputation is built only from
+reports that arrive. I'd build a service that tracks expected versus
+received traffic per agent and flags the ones that go quiet or unreadable,
+feeding that to the trust layer as evidence rather than as absence. Right
+now, an agent nobody can hear from is scored the same as an agent that
+isn't there.
+
 ## Use of AI / other help
 
-I used Claude Code (an AI coding assistant) throughout this exercise:
-- To explore the installed `nest-core` package source and explain how
-  message delivery, failure injection, and the reputation scenario's
-  scoring actually work at the code level (which methods call which, in
-  what order) — I asked it to show me the exact file/line evidence before
-  I trusted any claim about the mechanism.
-- To run the `nest` CLI commands and write `analyze_reputation.py`, the
-  small script used to reconstruct reputation-specific metrics from the
-  raw trace (since the built-in metrics don't cover this scenario).
+I used Claude Code in PowerShell throughout: to read the installed
+`nest-core` source and explain the delivery, failure-injection, and
+reputation-scoring paths with file and line references; to run the `nest`
+CLI (`scenarios cp`, `run`, `report`); and to write `analyze_reputation.py`,
+which rebuilds reputation-specific metrics from the raw trace. I used the
+NANDA Town quickstart and the writing-a-scenario doc for CLI syntax and YAML
+structure. I also used Claude in the browser to pressure-test the experiment
+design.
 
-The choice of scenario, the setting to change, and the hypothesis (including
-correcting my own first guess after understanding the reporting mechanism)
-were mine — I worked through the reasoning with the assistant asking me
-clarifying questions and citing code rather than handing me conclusions.
+The scenario, the setting, and the hypothesis were mine, arrived at by
+questioning what the code actually did.
