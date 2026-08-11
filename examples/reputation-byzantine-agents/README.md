@@ -4,12 +4,20 @@ Part A/B/C exercise for the NANDA Town quickstart. Scenario: `reputation`.
 Setting changed: `failures.byzantine_agents` (`0.0` -> `0.2`), one setting,
 everything else identical (same seed, same agent counts, same rounds).
 
+The diff against the bundled `reputation` scenario touches four lines:
+`name` and `description` are renamed for the variant, `output.trace` points
+to a separate file so this run doesn't overwrite the baseline trace, and
+`failures.byzantine_agents` goes from unset (0.0 default) to 0.2. That last
+one is the only functional change. I confirmed this by running
+`nest scenarios show reputation` and diffing it against
+`reputation_byzantine.yaml`.
+
 ## Which setting I changed, and why
 
 I changed `failures.byzantine_agents` in the reputation scenario from 0.0 to
 0.2, holding seed, agent counts, and rounds constant. I picked `reputation`
 because trust between counterparties is the part of any market I find most
-interesting — it's not just about whether messages get delivered, it's about
+interesting. It's not just about whether messages get delivered, it's about
 whether bad behavior gets caught.
 
 ## Hypothesis
@@ -28,12 +36,12 @@ because their behavior gets dropped instead of caught.
 
 ```
 nest run reputation -o traces/reputation_baseline.jsonl
-nest run reputation_byzantine.yaml -o traces/reputation_byzantine.jsonl
+nest run ./reputation_byzantine.yaml -o traces/reputation_byzantine.jsonl
 python analyze_reputation.py
 ```
 
 `reputation_byzantine.yaml` is the base `reputation` scenario with exactly
-one line changed: `failures.byzantine_agents: 0.0 -> 0.2`.
+one functional line changed: `failures.byzantine_agents: 0.0 -> 0.2`.
 
 `nest`'s built-in metrics (`nest report`) don't cover reputation-specific
 signal (report counts, warnings, per-agent scores), so `analyze_reputation.py`
@@ -58,12 +66,9 @@ At 0.2: 38 reports, 35 good and 3 bad, 1 warning, malicious average up to
 | Total message volume (`nest report`) | 620 | 304 | -51% |
 | Unique interacting pairs | 101 | 68 | -33 |
 
-Nest's built-in metrics don't cover reputation-specific detection, so I had
-Claude Code write a script that replays the observer's own +1 good, -2 bad
-rule over the raw trace. What really matters is that bad reports fell 70
-percent while total reports fell 52 percent. Corruption suppresses the
-detection of cheating specifically, not just message volume. The agents
-behaving worst came out of it looking better than before.
+What really matters is that bad reports fell 70 percent while total reports
+fell 52 percent. The agents behaving worst came out of it looking better
+than before.
 
 ## Investigating the surprise
 
@@ -82,12 +87,19 @@ directions. That's a stronger failure mode than I predicted, and the more
 concerning one, because the system can't tell the difference between an
 agent behaving well and an agent it can't hear.
 
-One more thing worth noting, not surprising but worth being honest about:
-honest agents' average score also dropped (3.88 -> 2.46). That's the same
-no-retry mechanism playing out system-wide, not a separate effect —
-byzantine corruption stalls negotiation threads early throughout the system
-(not just malicious-flagged ones), so there's less total activity for
-anyone, honest or malicious, to be reported on.
+One more thing, and I want to be precise about what I actually checked:
+honest agents' average score also fell, from 3.88 to 2.46. I verified why
+rather than assume it was the same story as malicious-0. `HonestAgent`,
+`MaliciousAgent`, and `ObserverAgent` (all in `reputation.py`) handle
+`on_message` with an if/elif chain and no `else` branch, and nothing in the
+scenario schedules a timeout or retry. A corrupted payload that doesn't
+match `trade:`, `deliver:`, `cheat:`, or `report:` isn't rejected, it's
+silently ignored: the method returns, the round never advances, and nobody
+sends the next message. With `byzantine_agents=0.2` that happens throughout
+the run, not only to malicious-flagged agents, so total activity drops and
+honest agents end up with fewer interactions to be reported on too. This is
+a reporting artifact of the no-retry design, not honest agents behaving any
+worse.
 
 ## What I'd build next for NANDA Town
 
@@ -108,7 +120,9 @@ CLI (`scenarios cp`, `run`, `report`); and to write `analyze_reputation.py`,
 which rebuilds reputation-specific metrics from the raw trace. I used the
 NANDA Town quickstart and the writing-a-scenario doc for CLI syntax and YAML
 structure. I also used Claude in the browser to pressure-test the experiment
-design.
+design, including catching an unverified claim in an earlier draft about
+why honest agents' scores dropped, which sent me back to the source to
+confirm the mechanism before writing it up here.
 
 The scenario, the setting, and the hypothesis were mine, arrived at by
 questioning what the code actually did.
